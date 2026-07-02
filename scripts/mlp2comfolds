@@ -1,0 +1,261 @@
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+import matplotlib.pyplot as plt
+
+torch.manual_seed(42)
+np.random.seed(42)
+
+K_FOLDS = 5
+
+tabela = pd.read_csv("subset.csv")
+rotulos = tabela["target"].values
+
+nome_coluna_aneis = ""
+for coluna in tabela.columns:
+    if "ringsE" in coluna:
+        nome_coluna_aneis = coluna
+        break
+
+
+def texto_para_array(s):
+    return np.fromstring(str(s).strip("[]"), sep=",")
+
+
+energia_aneis = np.vstack(tabela[nome_coluna_aneis].apply(texto_para_array).values)
+
+
+def split_estratificado(X, y, frac_teste, seed=42):
+    rng = np.random.default_rng(seed)
+    idx_a, idx_b = [], []
+    for classe in np.unique(y):
+        idx = np.where(y == classe)[0]
+        rng.shuffle(idx)
+        corte = int(len(idx) * (1 - frac_teste))
+        idx_a.extend(idx[:corte])
+        idx_b.extend(idx[corte:])
+    idx_a, idx_b = np.array(idx_a), np.array(idx_b)
+    rng.shuffle(idx_a)
+    rng.shuffle(idx_b)
+    return X[idx_a], X[idx_b], y[idx_a], y[idx_b]
+
+
+def kfold_estratificado(y, k, seed=42):
+    rng = np.random.default_rng(seed)
+    folds = [[] for _ in range(k)]
+    for classe in np.unique(y):
+        idx = rng.permutation(np.where(y == classe)[0])
+        for i, parte in enumerate(np.array_split(idx, k)):
+            folds[i].extend(parte)
+    folds = [np.array(f) for f in folds]
+    for i in range(k):
+        idx_val = folds[i]
+        idx_treino = np.concatenate([folds[j] for j in range(k) if j != i])
+        yield idx_treino, idx_val
+
+
+def roc_curve_manual(y_true, y_score):
+    limiares = np.concatenate(([np.inf], np.sort(np.unique(y_score))[::-1]))
+    P = np.sum(y_true == 1)
+    N = np.sum(y_true == 0)
+    tprs, fprs = [], []
+    for t in limiares:
+        pred = (y_score >= t).astype(int)
+        tp_ = np.sum((pred == 1) & (y_true == 1))
+        fp_ = np.sum((pred == 1) & (y_true == 0))
+        tprs.append(tp_ / P if P > 0 else 0.0)
+        fprs.append(fp_ / N if N > 0 else 0.0)
+    return np.array(fprs), np.array(tprs)
+
+
+def avaliar(modelo, batches):
+    modelo.eval()
+    probs, reais = [], []
+    with torch.no_grad():
+        for aneis_batch, rotulos_batch in batches:
+            saida = modelo(aneis_batch)
+            probs.extend(saida.squeeze(1).tolist())
+            reais.extend(rotulos_batch.squeeze(1).tolist())
+    probs = np.array(probs)
+    reais = np.array(reais)
+    preds = (probs >= 0.5).astype(int)
+    tp = np.sum((preds == 1) & (reais == 1))
+    tn = np.sum((preds == 0) & (reais == 0))
+    fp = np.sum((preds == 1) & (reais == 0))
+    fn = np.sum((preds == 0) & (reais == 1))
+    cm = np.array([[tn, fp], [fn, tp]])
+    acc = (tp + tn) / (tp + tn + fp + fn)
+    pd_ = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    fa_ = fp / (fp + tn) if (fp + tn) > 0 else 0.0
+    fpr, tpr = roc_curve_manual(reais, probs)
+    auc_ = np.trapezoid(tpr, fpr)
+    return acc, pd_, fa_, auc_, cm, fpr, tpr
+
+
+class MLP(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.rede = nn.Sequential(
+            nn.Linear(100, 5),
+            nn.ReLU(),
+            nn.Linear(5, 1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        return self.rede(x)
+
+
+aneis_dev, aneis_teste, rotulos_dev, rotulos_teste = split_estratificado(energia_aneis, rotulos, 0.2)
+
+historicos_loss_treino = []
+historicos_loss_val = []
+metricas_val = {"acuracia": [], "pd": [], "fa": [], "auc": []}
+metricas_teste = {"acuracia": [], "pd": [], "fa": [], "auc": []}
+curvas_roc_teste = []
+matrizes_confusao = []
+
+for fold, (idx_treino, idx_val) in enumerate(kfold_estratificado(rotulos_dev, K_FOLDS), start=1):
+    aneis_treino, aneis_val = aneis_dev[idx_treino], aneis_dev[idx_val]
+    rotulos_treino, rotulos_val = rotulos_dev[idx_treino], rotulos_dev[idx_val]
+
+    media = aneis_treino.mean(axis=0)
+    desvio = aneis_treino.std(axis=0) + 1e-8
+    aneis_treino_norm = (aneis_treino - media) / desvio
+    aneis_val_norm = (aneis_val - media) / desvio
+    aneis_teste_norm = (aneis_teste - media) / desvio
+
+    batches_treino = DataLoader(TensorDataset(
+        torch.tensor(aneis_treino_norm, dtype=torch.float32),
+        torch.tensor(rotulos_treino, dtype=torch.float32).unsqueeze(1)), batch_size=256, shuffle=True)
+    batches_val = DataLoader(TensorDataset(
+        torch.tensor(aneis_val_norm, dtype=torch.float32),
+        torch.tensor(rotulos_val, dtype=torch.float32).unsqueeze(1)), batch_size=256, shuffle=False)
+    batches_teste = DataLoader(TensorDataset(
+        torch.tensor(aneis_teste_norm, dtype=torch.float32),
+        torch.tensor(rotulos_teste, dtype=torch.float32).unsqueeze(1)), batch_size=256, shuffle=False)
+
+    modelo = MLP()
+    criterio = nn.BCELoss()
+    otimizador = torch.optim.Adam(modelo.parameters(), lr=1e-3)
+
+    loss_treino_fold, loss_val_fold = [], []
+    melhor_loss_val = float("inf")
+    epocas_sem_melhora = 0
+    melhores_pesos = None
+    paciencia = 5
+
+    for epoca in range(1, 101):
+        modelo.train()
+        perdas_treino = []
+        for aneis_batch, rotulos_batch in batches_treino:
+            otimizador.zero_grad()
+            loss = criterio(modelo(aneis_batch), rotulos_batch)
+            loss.backward()
+            otimizador.step()
+            perdas_treino.append(loss.item())
+
+        modelo.eval()
+        perdas_val = []
+        with torch.no_grad():
+            for aneis_batch, rotulos_batch in batches_val:
+                loss = criterio(modelo(aneis_batch), rotulos_batch)
+                perdas_val.append(loss.item())
+
+        loss_treino_medio = np.mean(perdas_treino)
+        loss_val_medio = np.mean(perdas_val)
+        loss_treino_fold.append(loss_treino_medio)
+        loss_val_fold.append(loss_val_medio)
+
+        if loss_val_medio < melhor_loss_val:
+            melhor_loss_val = loss_val_medio
+            epocas_sem_melhora = 0
+            melhores_pesos = {nome: peso.clone() for nome, peso in modelo.state_dict().items()}
+        else:
+            epocas_sem_melhora += 1
+
+        if epocas_sem_melhora == paciencia:
+            break
+
+    modelo.load_state_dict(melhores_pesos)
+    historicos_loss_treino.append(loss_treino_fold)
+    historicos_loss_val.append(loss_val_fold)
+    torch.save(modelo.state_dict(), f"mlp_modelo2_fold{fold}.pt")
+
+    acc_val, pd_val, fa_val, auc_val, _, _, _ = avaliar(modelo, batches_val)
+    metricas_val["acuracia"].append(acc_val)
+    metricas_val["pd"].append(pd_val)
+    metricas_val["fa"].append(fa_val)
+    metricas_val["auc"].append(auc_val)
+
+    acc_teste, pd_teste, fa_teste, auc_teste, cm_teste, fpr_teste, tpr_teste = avaliar(modelo, batches_teste)
+    metricas_teste["acuracia"].append(acc_teste)
+    metricas_teste["pd"].append(pd_teste)
+    metricas_teste["fa"].append(fa_teste)
+    metricas_teste["auc"].append(auc_teste)
+    curvas_roc_teste.append((fpr_teste, tpr_teste, auc_teste))
+    matrizes_confusao.append(cm_teste)
+
+    print(f"Fold {fold} | Val Acc: {acc_val*100:.2f}% AUC: {auc_val:.4f} | "
+          f"Teste Acc: {acc_teste*100:.2f}% AUC: {auc_teste:.4f}")
+
+fig, eixos = plt.subplots(1, K_FOLDS, figsize=(4 * K_FOLDS, 4), sharey=True)
+for i in range(K_FOLDS):
+    eixos[i].plot(historicos_loss_treino[i], label="Treino")
+    eixos[i].plot(historicos_loss_val[i], label="Validação")
+    eixos[i].set_title(f"Fold {i+1}")
+    eixos[i].set_xlabel("Época")
+    eixos[i].grid(alpha=0.3)
+eixos[0].set_ylabel("Loss (BCE)")
+eixos[0].legend()
+plt.tight_layout()
+plt.savefig("modelo2_curvas_loss_folds.png", dpi=150)
+plt.close()
+
+fig, eixos = plt.subplots(1, K_FOLDS, figsize=(4 * K_FOLDS, 4))
+for i in range(K_FOLDS):
+    cm = matrizes_confusao[i]
+    eixos[i].imshow(cm, cmap="Blues")
+    for a in range(2):
+        for b in range(2):
+            eixos[i].text(b, a, str(cm[a, b]), ha="center", va="center", fontsize=14)
+    eixos[i].set_xticks([0, 1], ["Ruído (0)", "Sinal (1)"])
+    eixos[i].set_yticks([0, 1], ["Ruído (0)", "Sinal (1)"])
+    eixos[i].set_xlabel("Predito")
+    eixos[i].set_title(f"Fold {i+1}")
+eixos[0].set_ylabel("Real")
+plt.tight_layout()
+plt.savefig("modelo2_matrizes_confusao_folds.png", dpi=150)
+plt.close()
+
+plt.figure(figsize=(6, 5))
+for i, (fpr, tpr, auc_fold) in enumerate(curvas_roc_teste, start=1):
+    plt.plot(fpr, tpr, alpha=0.5, label=f"Fold {i} (AUC = {auc_fold:.3f})")
+plt.plot([0, 1], [0, 1], "--", color="gray", label="Chance Aleatória")
+plt.xlabel("FPR")
+plt.ylabel("TPR")
+plt.title("Modelo 2 - Curva ROC por Fold")
+plt.legend(fontsize=8)
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.savefig("modelo2_curva_roc_folds.png", dpi=150)
+plt.close()
+
+
+def media_desvio(lista):
+    arr = np.array(lista)
+    return arr.mean(), arr.std()
+
+
+print("\n=== Resultados ===")
+print("(Média ± Desvio Padrão entre os folds)")
+for nome_split, dic in [("Validação", metricas_val), ("Teste", metricas_teste)]:
+    print(f"\n{nome_split}:")
+    for chave, valores in dic.items():
+        m, s = media_desvio(valores)
+        if chave == "auc":
+            print(f"  AUC: {m:.4f} ± {s:.4f}")
+        else:
+            print(f"  {chave.upper()}: {m*100:.2f}% ± {s*100:.2f}%")
