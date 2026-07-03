@@ -25,19 +25,21 @@ def texto_para_array(s):
 energia_aneis = np.vstack(tabela[nome_coluna_aneis].apply(texto_para_array).values)
 
 
-def split_estratificado(X, y, frac_teste, seed=42):
-    rng = np.random.default_rng(seed)
-    idx_a, idx_b = [], []
-    for classe in np.unique(y):
-        idx = np.where(y == classe)[0]
-        rng.shuffle(idx)
-        corte = int(len(idx) * (1 - frac_teste))
-        idx_a.extend(idx[:corte])
-        idx_b.extend(idx[corte:])
-    idx_a, idx_b = np.array(idx_a), np.array(idx_b)
-    rng.shuffle(idx_a)
-    rng.shuffle(idx_b)
-    return X[idx_a], X[idx_b], y[idx_a], y[idx_b]
+def split_estratificado(dados_entrada, rotulos_entrada, fracao_conjunto_b, semente=42):
+    gerador_aleatorio = np.random.default_rng(semente)
+    indices_conjunto_a, indices_conjunto_b = [], []
+    for classe_rotulo in np.unique(rotulos_entrada):
+        indices_da_classe = np.where(rotulos_entrada == classe_rotulo)[0]
+        gerador_aleatorio.shuffle(indices_da_classe)
+        ponto_de_corte = int(len(indices_da_classe) * (1 - fracao_conjunto_b))
+        indices_conjunto_a.extend(indices_da_classe[:ponto_de_corte])
+        indices_conjunto_b.extend(indices_da_classe[ponto_de_corte:])
+    indices_conjunto_a = np.array(indices_conjunto_a)
+    indices_conjunto_b = np.array(indices_conjunto_b)
+    gerador_aleatorio.shuffle(indices_conjunto_a)
+    gerador_aleatorio.shuffle(indices_conjunto_b)
+    return (dados_entrada[indices_conjunto_a], dados_entrada[indices_conjunto_b],
+            rotulos_entrada[indices_conjunto_a], rotulos_entrada[indices_conjunto_b])
 
 
 aneis_treino, aneis_temp, rotulos_treino, rotulos_temp = split_estratificado(energia_aneis, rotulos, 0.4)
@@ -45,15 +47,15 @@ aneis_val, aneis_teste, rotulos_val, rotulos_teste = split_estratificado(aneis_t
 
 media = aneis_treino.mean(axis=0)
 desvio = aneis_treino.std(axis=0) + 1e-8
-aneis_treino_norm = (aneis_treino - media) / desvio
-aneis_val_norm = (aneis_val - media) / desvio
-aneis_teste_norm = (aneis_teste - media) / desvio
+aneis_treino_normalizado = (aneis_treino - media) / desvio
+aneis_val_normalizado = (aneis_val - media) / desvio
+aneis_teste_normalizado = (aneis_teste - media) / desvio
 
-dataset_treino = TensorDataset(torch.tensor(aneis_treino_norm, dtype=torch.float32),
+dataset_treino = TensorDataset(torch.tensor(aneis_treino_normalizado, dtype=torch.float32),
                                 torch.tensor(rotulos_treino, dtype=torch.float32).unsqueeze(1))
-dataset_val = TensorDataset(torch.tensor(aneis_val_norm, dtype=torch.float32),
+dataset_val = TensorDataset(torch.tensor(aneis_val_normalizado, dtype=torch.float32),
                              torch.tensor(rotulos_val, dtype=torch.float32).unsqueeze(1))
-dataset_teste = TensorDataset(torch.tensor(aneis_teste_norm, dtype=torch.float32),
+dataset_teste = TensorDataset(torch.tensor(aneis_teste_normalizado, dtype=torch.float32),
                                torch.tensor(rotulos_teste, dtype=torch.float32).unsqueeze(1))
 
 batches_treino = DataLoader(dataset_treino, batch_size=256, shuffle=True)
@@ -136,69 +138,79 @@ plt.savefig("modelo1_curva_loss.png", dpi=150)
 plt.close()
 
 
-def roc_curve_manual(y_true, y_score):
-    limiares = np.concatenate(([np.inf], np.sort(np.unique(y_score))[::-1]))
-    P = np.sum(y_true == 1)
-    N = np.sum(y_true == 0)
-    tprs, fprs = [], []
-    for t in limiares:
-        pred = (y_score >= t).astype(int)
-        tp_ = np.sum((pred == 1) & (y_true == 1))
-        fp_ = np.sum((pred == 1) & (y_true == 0))
-        tprs.append(tp_ / P if P > 0 else 0.0)
-        fprs.append(fp_ / N if N > 0 else 0.0)
-    return np.array(fprs), np.array(tprs)
+def curva_roc_manual(rotulos_verdadeiros, probabilidades_preditas):
+    limiares_decisao = np.concatenate(([np.inf], np.sort(np.unique(probabilidades_preditas))[::-1]))
+    total_positivos = np.sum(rotulos_verdadeiros == 1)
+    total_negativos = np.sum(rotulos_verdadeiros == 0)
+    taxas_verdadeiro_positivo, taxas_falso_positivo = [], []
+    for limiar in limiares_decisao:
+        predicao_no_limiar = (probabilidades_preditas >= limiar).astype(int)
+        verdadeiros_positivos = np.sum((predicao_no_limiar == 1) & (rotulos_verdadeiros == 1))
+        falsos_positivos = np.sum((predicao_no_limiar == 1) & (rotulos_verdadeiros == 0))
+        taxas_verdadeiro_positivo.append(verdadeiros_positivos / total_positivos if total_positivos > 0 else 0.0)
+        taxas_falso_positivo.append(falsos_positivos / total_negativos if total_negativos > 0 else 0.0)
+    return np.array(taxas_falso_positivo), np.array(taxas_verdadeiro_positivo)
 
 
-def avaliar(modelo, batches):
-    modelo.eval()
-    probs, reais = [], []
+def avaliar_modelo(modelo_avaliado, batches_avaliacao):
+    modelo_avaliado.eval()
+    probabilidades, rotulos_reais = [], []
     with torch.no_grad():
-        for aneis_batch, rotulos_batch in batches:
-            saida = modelo(aneis_batch)
-            probs.extend(saida.squeeze(1).tolist())
-            reais.extend(rotulos_batch.squeeze(1).tolist())
-    probs = np.array(probs)
-    reais = np.array(reais)
-    preds = (probs >= 0.5).astype(int)
-    tp = np.sum((preds == 1) & (reais == 1))
-    tn = np.sum((preds == 0) & (reais == 0))
-    fp = np.sum((preds == 1) & (reais == 0))
-    fn = np.sum((preds == 0) & (reais == 1))
-    cm = np.array([[tn, fp], [fn, tp]])
-    acc = (tp + tn) / (tp + tn + fp + fn)
-    pd_ = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    fa_ = fp / (fp + tn) if (fp + tn) > 0 else 0.0
-    fpr, tpr = roc_curve_manual(reais, probs)
-    auc_ = np.trapezoid(tpr, fpr)
-    return acc, pd_, fa_, auc_, cm, fpr, tpr, probs, reais
+        for aneis_batch, rotulos_batch in batches_avaliacao:
+            saida = modelo_avaliado(aneis_batch)
+            probabilidades.extend(saida.squeeze(1).tolist())
+            rotulos_reais.extend(rotulos_batch.squeeze(1).tolist())
+    probabilidades = np.array(probabilidades)
+    rotulos_reais = np.array(rotulos_reais)
+    predicoes_binarias = (probabilidades >= 0.5).astype(int)
+
+    verdadeiros_positivos = np.sum((predicoes_binarias == 1) & (rotulos_reais == 1))
+    verdadeiros_negativos = np.sum((predicoes_binarias == 0) & (rotulos_reais == 0))
+    falsos_positivos = np.sum((predicoes_binarias == 1) & (rotulos_reais == 0))
+    falsos_negativos = np.sum((predicoes_binarias == 0) & (rotulos_reais == 1))
+    matriz_confusao = np.array([[verdadeiros_negativos, falsos_positivos],
+                                 [falsos_negativos, verdadeiros_positivos]])
+
+    acuracia = (verdadeiros_positivos + verdadeiros_negativos) / len(rotulos_reais)
+    probabilidade_deteccao = verdadeiros_positivos / (verdadeiros_positivos + falsos_negativos) \
+        if (verdadeiros_positivos + falsos_negativos) > 0 else 0.0
+    falso_alarme = falsos_positivos / (falsos_positivos + verdadeiros_negativos) \
+        if (falsos_positivos + verdadeiros_negativos) > 0 else 0.0
+
+    taxa_falsos_positivos, taxa_verdadeiros_positivos = curva_roc_manual(rotulos_reais, probabilidades)
+    area_sob_curva = np.trapezoid(taxa_verdadeiros_positivos, taxa_falsos_positivos)
+
+    return (acuracia, probabilidade_deteccao, falso_alarme, area_sob_curva,
+            matriz_confusao, taxa_falsos_positivos, taxa_verdadeiros_positivos)
 
 
-acc_val, pd_val, fa_val, auc_val, cm_val, _, _, _, _ = avaliar(modelo, batches_val)
-acc_teste, pd_teste, fa_teste, auc_teste, matriz_confusao, fpr, tpr, probs_teste, rotulos_teste_arr = avaliar(modelo, batches_teste)
-area_sob_curva = auc_teste
+(acuracia_val, probabilidade_deteccao_val, falso_alarme_val, area_sob_curva_val,
+ matriz_confusao_val, _, _) = avaliar_modelo(modelo, batches_val)
+
+(acuracia_teste, probabilidade_deteccao_teste, falso_alarme_teste, area_sob_curva_teste,
+ matriz_confusao_teste, taxa_falsos_positivos_teste, taxa_verdadeiros_positivos_teste) = avaliar_modelo(modelo, batches_teste)
 
 print("\n=== Resultados ===")
 print("\nValidação:")
-print(f"  ACURACIA: {acc_val*100:.2f}%")
-print(f"  PD: {pd_val*100:.2f}%")
-print(f"  FA: {fa_val*100:.2f}%")
-print(f"  AUC: {auc_val:.4f}")
+print(f"  ACURACIA: {acuracia_val*100:.2f}%")
+print(f"  PD: {probabilidade_deteccao_val*100:.2f}%")
+print(f"  FA: {falso_alarme_val*100:.2f}%")
+print(f"  AUC: {area_sob_curva_val:.4f}")
 
 print("\nTeste:")
-print(f"  ACURACIA: {acc_teste*100:.2f}%")
-print(f"  PD: {pd_teste*100:.2f}%")
-print(f"  FA: {fa_teste*100:.2f}%")
-print(f"  AUC: {auc_teste:.4f}")
+print(f"  ACURACIA: {acuracia_teste*100:.2f}%")
+print(f"  PD: {probabilidade_deteccao_teste*100:.2f}%")
+print(f"  FA: {falso_alarme_teste*100:.2f}%")
+print(f"  AUC: {area_sob_curva_teste:.4f}")
 
 print("\nMatriz de Confusão (Teste):")
-print(matriz_confusao)
+print(matriz_confusao_teste)
 
 plt.figure(figsize=(5, 4))
-plt.imshow(matriz_confusao, cmap="Blues")
-for i in range(2):
-    for j in range(2):
-        plt.text(j, i, str(matriz_confusao[i, j]), ha="center", va="center", fontsize=14)
+plt.imshow(matriz_confusao_teste, cmap="Blues")
+for linha in range(2):
+    for coluna in range(2):
+        plt.text(coluna, linha, str(matriz_confusao_teste[linha, coluna]), ha="center", va="center", fontsize=14)
 plt.xticks([0, 1], ["Ruído (0)", "Sinal (1)"])
 plt.yticks([0, 1], ["Ruído (0)", "Sinal (1)"])
 plt.xlabel("Predito")
@@ -209,11 +221,11 @@ plt.tight_layout()
 plt.savefig("modelo1_matriz_confusao.png", dpi=150)
 plt.close()
 
-
 plt.figure(figsize=(6, 5))
-plt.plot(fpr, tpr, label=f"Modelo 1 (AUC = {area_sob_curva:.3f})", color="tab:orange")
+plt.plot(taxa_falsos_positivos_teste, taxa_verdadeiros_positivos_teste,
+         label=f"Modelo 1 (AUC = {area_sob_curva_teste:.3f})", color="tab:orange")
 plt.plot([0, 1], [0, 1], "--", color="gray", label="Chance Aleatória")
-plt.fill_between(fpr, tpr, alpha=0.2, color="tab:orange")
+plt.fill_between(taxa_falsos_positivos_teste, taxa_verdadeiros_positivos_teste, alpha=0.2, color="tab:orange")
 plt.xlabel("FPR")
 plt.ylabel("TPR")
 plt.title("Modelo 1 - Curva ROC")
