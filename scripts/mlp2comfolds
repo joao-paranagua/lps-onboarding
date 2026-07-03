@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 torch.manual_seed(42)
 np.random.seed(42)
 
-K_FOLDS = 5
+NUMERO_FOLDS = 5
 
 tabela = pd.read_csv("subset.csv")
 rotulos = tabela["target"].values
@@ -27,71 +27,81 @@ def texto_para_array(s):
 energia_aneis = np.vstack(tabela[nome_coluna_aneis].apply(texto_para_array).values)
 
 
-def split_estratificado(X, y, frac_teste, seed=42):
-    rng = np.random.default_rng(seed)
-    idx_a, idx_b = [], []
-    for classe in np.unique(y):
-        idx = np.where(y == classe)[0]
-        rng.shuffle(idx)
-        corte = int(len(idx) * (1 - frac_teste))
-        idx_a.extend(idx[:corte])
-        idx_b.extend(idx[corte:])
-    idx_a, idx_b = np.array(idx_a), np.array(idx_b)
-    rng.shuffle(idx_a)
-    rng.shuffle(idx_b)
-    return X[idx_a], X[idx_b], y[idx_a], y[idx_b]
+def split_estratificado(dados_entrada, rotulos_entrada, fracao_conjunto_b, semente=42):
+    gerador_aleatorio = np.random.default_rng(semente)
+    indices_conjunto_a, indices_conjunto_b = [], []
+    for classe_rotulo in np.unique(rotulos_entrada):
+        indices_da_classe = np.where(rotulos_entrada == classe_rotulo)[0]
+        gerador_aleatorio.shuffle(indices_da_classe)
+        ponto_de_corte = int(len(indices_da_classe) * (1 - fracao_conjunto_b))
+        indices_conjunto_a.extend(indices_da_classe[:ponto_de_corte])
+        indices_conjunto_b.extend(indices_da_classe[ponto_de_corte:])
+    indices_conjunto_a = np.array(indices_conjunto_a)
+    indices_conjunto_b = np.array(indices_conjunto_b)
+    gerador_aleatorio.shuffle(indices_conjunto_a)
+    gerador_aleatorio.shuffle(indices_conjunto_b)
+    return (dados_entrada[indices_conjunto_a], dados_entrada[indices_conjunto_b],
+            rotulos_entrada[indices_conjunto_a], rotulos_entrada[indices_conjunto_b])
 
 
-def kfold_estratificado(y, k, seed=42):
-    rng = np.random.default_rng(seed)
-    folds = [[] for _ in range(k)]
-    for classe in np.unique(y):
-        idx = rng.permutation(np.where(y == classe)[0])
-        for i, parte in enumerate(np.array_split(idx, k)):
-            folds[i].extend(parte)
-    folds = [np.array(f) for f in folds]
-    for i in range(k):
-        idx_val = folds[i]
-        idx_treino = np.concatenate([folds[j] for j in range(k) if j != i])
-        yield idx_treino, idx_val
+def kfold_estratificado(rotulos_entrada, numero_folds, semente=42):
+    gerador_aleatorio = np.random.default_rng(semente)
+    folds_por_indice = [[] for _ in range(numero_folds)]
+    for classe_rotulo in np.unique(rotulos_entrada):
+        indices_da_classe = gerador_aleatorio.permutation(np.where(rotulos_entrada == classe_rotulo)[0])
+        for indice_fold, subconjunto_fold in enumerate(np.array_split(indices_da_classe, numero_folds)):
+            folds_por_indice[indice_fold].extend(subconjunto_fold)
+    folds_por_indice = [np.array(fold) for fold in folds_por_indice]
+    for indice_fold in range(numero_folds):
+        indices_val = folds_por_indice[indice_fold]
+        indices_treino = np.concatenate([folds_por_indice[j] for j in range(numero_folds) if j != indice_fold])
+        yield indices_treino, indices_val
 
 
-def roc_curve_manual(y_true, y_score):
-    limiares = np.concatenate(([np.inf], np.sort(np.unique(y_score))[::-1]))
-    P = np.sum(y_true == 1)
-    N = np.sum(y_true == 0)
-    tprs, fprs = [], []
-    for t in limiares:
-        pred = (y_score >= t).astype(int)
-        tp_ = np.sum((pred == 1) & (y_true == 1))
-        fp_ = np.sum((pred == 1) & (y_true == 0))
-        tprs.append(tp_ / P if P > 0 else 0.0)
-        fprs.append(fp_ / N if N > 0 else 0.0)
-    return np.array(fprs), np.array(tprs)
+def curva_roc_manual(rotulos_verdadeiros, probabilidades_preditas):
+    limiares_decisao = np.concatenate(([np.inf], np.sort(np.unique(probabilidades_preditas))[::-1]))
+    total_positivos = np.sum(rotulos_verdadeiros == 1)
+    total_negativos = np.sum(rotulos_verdadeiros == 0)
+    taxas_verdadeiro_positivo, taxas_falso_positivo = [], []
+    for limiar in limiares_decisao:
+        predicao_no_limiar = (probabilidades_preditas >= limiar).astype(int)
+        verdadeiros_positivos = np.sum((predicao_no_limiar == 1) & (rotulos_verdadeiros == 1))
+        falsos_positivos = np.sum((predicao_no_limiar == 1) & (rotulos_verdadeiros == 0))
+        taxas_verdadeiro_positivo.append(verdadeiros_positivos / total_positivos if total_positivos > 0 else 0.0)
+        taxas_falso_positivo.append(falsos_positivos / total_negativos if total_negativos > 0 else 0.0)
+    return np.array(taxas_falso_positivo), np.array(taxas_verdadeiro_positivo)
 
 
-def avaliar(modelo, batches):
-    modelo.eval()
-    probs, reais = [], []
+def avaliar_modelo(modelo_avaliado, batches_avaliacao):
+    modelo_avaliado.eval()
+    probabilidades, rotulos_reais = [], []
     with torch.no_grad():
-        for aneis_batch, rotulos_batch in batches:
-            saida = modelo(aneis_batch)
-            probs.extend(saida.squeeze(1).tolist())
-            reais.extend(rotulos_batch.squeeze(1).tolist())
-    probs = np.array(probs)
-    reais = np.array(reais)
-    preds = (probs >= 0.5).astype(int)
-    tp = np.sum((preds == 1) & (reais == 1))
-    tn = np.sum((preds == 0) & (reais == 0))
-    fp = np.sum((preds == 1) & (reais == 0))
-    fn = np.sum((preds == 0) & (reais == 1))
-    cm = np.array([[tn, fp], [fn, tp]])
-    acc = (tp + tn) / (tp + tn + fp + fn)
-    pd_ = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    fa_ = fp / (fp + tn) if (fp + tn) > 0 else 0.0
-    fpr, tpr = roc_curve_manual(reais, probs)
-    auc_ = np.trapezoid(tpr, fpr)
-    return acc, pd_, fa_, auc_, cm, fpr, tpr
+        for aneis_batch, rotulos_batch in batches_avaliacao:
+            saida = modelo_avaliado(aneis_batch)
+            probabilidades.extend(saida.squeeze(1).tolist())
+            rotulos_reais.extend(rotulos_batch.squeeze(1).tolist())
+    probabilidades = np.array(probabilidades)
+    rotulos_reais = np.array(rotulos_reais)
+    predicoes_binarias = (probabilidades >= 0.5).astype(int)
+
+    verdadeiros_positivos = np.sum((predicoes_binarias == 1) & (rotulos_reais == 1))
+    verdadeiros_negativos = np.sum((predicoes_binarias == 0) & (rotulos_reais == 0))
+    falsos_positivos = np.sum((predicoes_binarias == 1) & (rotulos_reais == 0))
+    falsos_negativos = np.sum((predicoes_binarias == 0) & (rotulos_reais == 1))
+    matriz_confusao = np.array([[verdadeiros_negativos, falsos_positivos],
+                                 [falsos_negativos, verdadeiros_positivos]])
+
+    acuracia = (verdadeiros_positivos + verdadeiros_negativos) / len(rotulos_reais)
+    probabilidade_deteccao = verdadeiros_positivos / (verdadeiros_positivos + falsos_negativos) \
+        if (verdadeiros_positivos + falsos_negativos) > 0 else 0.0
+    falso_alarme = falsos_positivos / (falsos_positivos + verdadeiros_negativos) \
+        if (falsos_positivos + verdadeiros_negativos) > 0 else 0.0
+
+    taxa_falsos_positivos, taxa_verdadeiros_positivos = curva_roc_manual(rotulos_reais, probabilidades)
+    area_sob_curva = np.trapezoid(taxa_verdadeiros_positivos, taxa_falsos_positivos)
+
+    return (acuracia, probabilidade_deteccao, falso_alarme, area_sob_curva,
+            matriz_confusao, taxa_falsos_positivos, taxa_verdadeiros_positivos)
 
 
 class MLP(nn.Module):
@@ -115,27 +125,28 @@ historicos_loss_val = []
 metricas_val = {"acuracia": [], "pd": [], "fa": [], "auc": []}
 metricas_teste = {"acuracia": [], "pd": [], "fa": [], "auc": []}
 curvas_roc_teste = []
-matrizes_confusao = []
+matrizes_confusao_teste = []
 
-for fold, (idx_treino, idx_val) in enumerate(kfold_estratificado(rotulos_dev, K_FOLDS), start=1):
-    aneis_treino, aneis_val = aneis_dev[idx_treino], aneis_dev[idx_val]
-    rotulos_treino, rotulos_val = rotulos_dev[idx_treino], rotulos_dev[idx_val]
+for fold, (indices_treino, indices_val) in enumerate(kfold_estratificado(rotulos_dev, NUMERO_FOLDS), start=1):
+    aneis_treino, aneis_val = aneis_dev[indices_treino], aneis_dev[indices_val]
+    rotulos_treino, rotulos_val = rotulos_dev[indices_treino], rotulos_dev[indices_val]
 
     media = aneis_treino.mean(axis=0)
     desvio = aneis_treino.std(axis=0) + 1e-8
-    aneis_treino_norm = (aneis_treino - media) / desvio
-    aneis_val_norm = (aneis_val - media) / desvio
-    aneis_teste_norm = (aneis_teste - media) / desvio
+    aneis_treino_normalizado = (aneis_treino - media) / desvio
+    aneis_val_normalizado = (aneis_val - media) / desvio
+    aneis_teste_normalizado = (aneis_teste - media) / desvio
 
-    batches_treino = DataLoader(TensorDataset(
-        torch.tensor(aneis_treino_norm, dtype=torch.float32),
-        torch.tensor(rotulos_treino, dtype=torch.float32).unsqueeze(1)), batch_size=256, shuffle=True)
-    batches_val = DataLoader(TensorDataset(
-        torch.tensor(aneis_val_norm, dtype=torch.float32),
-        torch.tensor(rotulos_val, dtype=torch.float32).unsqueeze(1)), batch_size=256, shuffle=False)
-    batches_teste = DataLoader(TensorDataset(
-        torch.tensor(aneis_teste_norm, dtype=torch.float32),
-        torch.tensor(rotulos_teste, dtype=torch.float32).unsqueeze(1)), batch_size=256, shuffle=False)
+    dataset_treino = TensorDataset(torch.tensor(aneis_treino_normalizado, dtype=torch.float32),
+                                    torch.tensor(rotulos_treino, dtype=torch.float32).unsqueeze(1))
+    dataset_val = TensorDataset(torch.tensor(aneis_val_normalizado, dtype=torch.float32),
+                                 torch.tensor(rotulos_val, dtype=torch.float32).unsqueeze(1))
+    dataset_teste = TensorDataset(torch.tensor(aneis_teste_normalizado, dtype=torch.float32),
+                                   torch.tensor(rotulos_teste, dtype=torch.float32).unsqueeze(1))
+
+    batches_treino = DataLoader(dataset_treino, batch_size=256, shuffle=True)
+    batches_val = DataLoader(dataset_val, batch_size=256, shuffle=False)
+    batches_teste = DataLoader(dataset_teste, batch_size=256, shuffle=False)
 
     modelo = MLP()
     criterio = nn.BCELoss()
@@ -184,55 +195,58 @@ for fold, (idx_treino, idx_val) in enumerate(kfold_estratificado(rotulos_dev, K_
     historicos_loss_val.append(loss_val_fold)
     torch.save(modelo.state_dict(), f"mlp_modelo2_fold{fold}.pt")
 
-    acc_val, pd_val, fa_val, auc_val, _, _, _ = avaliar(modelo, batches_val)
-    metricas_val["acuracia"].append(acc_val)
-    metricas_val["pd"].append(pd_val)
-    metricas_val["fa"].append(fa_val)
-    metricas_val["auc"].append(auc_val)
+    acuracia_val, probabilidade_deteccao_val, falso_alarme_val, area_sob_curva_val, _, _, _ = avaliar_modelo(modelo, batches_val)
+    metricas_val["acuracia"].append(acuracia_val)
+    metricas_val["pd"].append(probabilidade_deteccao_val)
+    metricas_val["fa"].append(falso_alarme_val)
+    metricas_val["auc"].append(area_sob_curva_val)
 
-    acc_teste, pd_teste, fa_teste, auc_teste, cm_teste, fpr_teste, tpr_teste = avaliar(modelo, batches_teste)
-    metricas_teste["acuracia"].append(acc_teste)
-    metricas_teste["pd"].append(pd_teste)
-    metricas_teste["fa"].append(fa_teste)
-    metricas_teste["auc"].append(auc_teste)
-    curvas_roc_teste.append((fpr_teste, tpr_teste, auc_teste))
-    matrizes_confusao.append(cm_teste)
+    (acuracia_teste, probabilidade_deteccao_teste, falso_alarme_teste, area_sob_curva_teste,
+     matriz_confusao_teste, taxa_falsos_positivos_teste, taxa_verdadeiros_positivos_teste) = avaliar_modelo(modelo, batches_teste)
+    metricas_teste["acuracia"].append(acuracia_teste)
+    metricas_teste["pd"].append(probabilidade_deteccao_teste)
+    metricas_teste["fa"].append(falso_alarme_teste)
+    metricas_teste["auc"].append(area_sob_curva_teste)
+    curvas_roc_teste.append((taxa_falsos_positivos_teste, taxa_verdadeiros_positivos_teste, area_sob_curva_teste))
+    matrizes_confusao_teste.append(matriz_confusao_teste)
 
-    print(f"Fold {fold} | Val Acc: {acc_val*100:.2f}% AUC: {auc_val:.4f} | "
-          f"Teste Acc: {acc_teste*100:.2f}% AUC: {auc_teste:.4f}")
+    print(f"Fold {fold} | Val Acc: {acuracia_val*100:.2f}% AUC: {area_sob_curva_val:.4f} | "
+          f"Teste Acc: {acuracia_teste*100:.2f}% AUC: {area_sob_curva_teste:.4f}")
 
-fig, eixos = plt.subplots(1, K_FOLDS, figsize=(4 * K_FOLDS, 4), sharey=True)
-for i in range(K_FOLDS):
-    eixos[i].plot(historicos_loss_treino[i], label="Treino")
-    eixos[i].plot(historicos_loss_val[i], label="Validação")
-    eixos[i].set_title(f"Fold {i+1}")
-    eixos[i].set_xlabel("Época")
-    eixos[i].grid(alpha=0.3)
+figura, eixos = plt.subplots(1, NUMERO_FOLDS, figsize=(4 * NUMERO_FOLDS, 4), sharey=True)
+for indice_fold in range(NUMERO_FOLDS):
+    eixos[indice_fold].plot(historicos_loss_treino[indice_fold], label="Treino")
+    eixos[indice_fold].plot(historicos_loss_val[indice_fold], label="Validação")
+    eixos[indice_fold].set_title(f"Fold {indice_fold+1}")
+    eixos[indice_fold].set_xlabel("Época")
+    eixos[indice_fold].grid(alpha=0.3)
 eixos[0].set_ylabel("Loss (BCE)")
 eixos[0].legend()
 plt.tight_layout()
 plt.savefig("modelo2_curvas_loss_folds.png", dpi=150)
 plt.close()
 
-fig, eixos = plt.subplots(1, K_FOLDS, figsize=(4 * K_FOLDS, 4))
-for i in range(K_FOLDS):
-    cm = matrizes_confusao[i]
-    eixos[i].imshow(cm, cmap="Blues")
-    for a in range(2):
-        for b in range(2):
-            eixos[i].text(b, a, str(cm[a, b]), ha="center", va="center", fontsize=14)
-    eixos[i].set_xticks([0, 1], ["Ruído (0)", "Sinal (1)"])
-    eixos[i].set_yticks([0, 1], ["Ruído (0)", "Sinal (1)"])
-    eixos[i].set_xlabel("Predito")
-    eixos[i].set_title(f"Fold {i+1}")
+figura, eixos = plt.subplots(1, NUMERO_FOLDS, figsize=(4 * NUMERO_FOLDS, 4))
+for indice_fold in range(NUMERO_FOLDS):
+    matriz_confusao_fold = matrizes_confusao_teste[indice_fold]
+    eixos[indice_fold].imshow(matriz_confusao_fold, cmap="Blues")
+    for linha in range(2):
+        for coluna in range(2):
+            eixos[indice_fold].text(coluna, linha, str(matriz_confusao_fold[linha, coluna]),
+                                     ha="center", va="center", fontsize=14)
+    eixos[indice_fold].set_xticks([0, 1], ["Ruído (0)", "Sinal (1)"])
+    eixos[indice_fold].set_yticks([0, 1], ["Ruído (0)", "Sinal (1)"])
+    eixos[indice_fold].set_xlabel("Predito")
+    eixos[indice_fold].set_title(f"Fold {indice_fold+1}")
 eixos[0].set_ylabel("Real")
 plt.tight_layout()
 plt.savefig("modelo2_matrizes_confusao_folds.png", dpi=150)
 plt.close()
 
 plt.figure(figsize=(6, 5))
-for i, (fpr, tpr, auc_fold) in enumerate(curvas_roc_teste, start=1):
-    plt.plot(fpr, tpr, alpha=0.5, label=f"Fold {i} (AUC = {auc_fold:.3f})")
+for indice_fold, (taxa_falsos_positivos, taxa_verdadeiros_positivos, area_sob_curva) in enumerate(curvas_roc_teste, start=1):
+    plt.plot(taxa_falsos_positivos, taxa_verdadeiros_positivos, alpha=0.5,
+              label=f"Fold {indice_fold} (AUC = {area_sob_curva:.3f})")
 plt.plot([0, 1], [0, 1], "--", color="gray", label="Chance Aleatória")
 plt.xlabel("FPR")
 plt.ylabel("TPR")
@@ -244,18 +258,18 @@ plt.savefig("modelo2_curva_roc_folds.png", dpi=150)
 plt.close()
 
 
-def media_desvio(lista):
-    arr = np.array(lista)
-    return arr.mean(), arr.std()
+def media_desvio(lista_valores):
+    valores_array = np.array(lista_valores)
+    return valores_array.mean(), valores_array.std()
 
 
 print("\n=== Resultados ===")
 print("(Média ± Desvio Padrão entre os folds)")
-for nome_split, dic in [("Validação", metricas_val), ("Teste", metricas_teste)]:
-    print(f"\n{nome_split}:")
-    for chave, valores in dic.items():
-        m, s = media_desvio(valores)
-        if chave == "auc":
-            print(f"  AUC: {m:.4f} ± {s:.4f}")
+for nome_conjunto, metricas_dict in [("Validação", metricas_val), ("Teste", metricas_teste)]:
+    print(f"\n{nome_conjunto}:")
+    for nome_metrica, lista_valores in metricas_dict.items():
+        media_valor, desvio_valor = media_desvio(lista_valores)
+        if nome_metrica == "auc":
+            print(f"  AUC: {media_valor:.4f} ± {desvio_valor:.4f}")
         else:
-            print(f"  {chave.upper()}: {m*100:.2f}% ± {s*100:.2f}%")
+            print(f"  {nome_metrica.upper()}: {media_valor*100:.2f}% ± {desvio_valor*100:.2f}%")
